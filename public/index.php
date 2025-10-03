@@ -1,49 +1,71 @@
 <?php
 // public/index.php
 
-// 1. กำหนด path และโหลดไฟล์ที่จำเป็น
-define('BASE_PATH', dirname(__DIR__));
-require_once BASE_PATH . '/src/ApplianceController.php';
-require_once BASE_PATH . '/src/Response.php'; // โหลด Response Helper
+// กำหนดให้แสดง Error ในระหว่างการพัฒนา
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
 
-// 2. จัดการ CORS Preflight (OPTIONS Request)
-Response::setCORSHeaders();
-Response::handlePreflight();
+// โหลด Controller และ Response
+require_once __DIR__ . '/../src/Response.php';
+require_once __DIR__ . '/../src/ApplianceController.php';
 
-// 3. เตรียมข้อมูล Request
-$method = $_SERVER['REQUEST_METHOD'];
-$uri = trim($_SERVER['REQUEST_URI'], '/');
-// แยกส่วน URI (เช่น /appliances/123)
-$uri_parts = explode('/', $uri); 
-// ดึงข้อมูล JSON Body สำหรับ POST, PUT, PATCH
-$input = file_get_contents("php://input");
-$data = json_decode($input, true) ?? [];
-
-// 4. สร้าง Controller Instance
-$controller = new ApplianceController();
-
-// หา 'api' และ 'appliances' ใน $uri_parts
-$api_index = array_search('api', $uri_parts);
-if ($api_index !== false && isset($uri_parts[$api_index + 1]) && $uri_parts[$api_index + 1] === 'appliances') {
-    $id = isset($uri_parts[$api_index + 2]) && is_numeric($uri_parts[$api_index + 2]) ? (int) $uri_parts[$api_index + 2] : null;
-
-    switch ($method) {
-        case 'GET':
-            $id ? $controller->show($id) : $controller->index();
-            break;
-        case 'POST':
-            $controller->store($data);
-            break;
-        case 'PUT':
-        case 'PATCH':
-            $id ? $controller->update($id, $data) : Response::json(400, ["error" => "Missing ID for Update operation"]);
-            break;
-        case 'DELETE':
-            $id ? $controller->delete($id) : Response::json(400, ["error" => "Missing ID for Delete operation"]);
-            break;
-        default:
-            Response::json(405, ["error" => "Method Not Allowed"]);
-    }
-} else {
-    Response::json(404, ["error" => "Not Found: Invalid API endpoint"]);
+// รองรับ CORS สำหรับ Preflight OPTIONS Request [cite: 9]
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    header("Access-Control-Allow-Origin: *");
+    header("Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    header("Access-Control-Allow-Headers: Content-Type, Authorization");
+    http_response_code(200);
+    exit();
 }
+
+$method = $_SERVER['REQUEST_METHOD'];
+// ดึง path ที่ถูกส่งมาจาก .htaccess (เช่น 'appliances' หรือ 'appliances/3')
+// **ค่าที่ได้ตอนนี้คือ 'appliances' หรือ 'appliances/3'**
+$path = isset($_GET['path']) ? explode('/', trim($_GET['path'], '/')) : [];
+
+// --- ส่วนที่ต้องแก้ไข/ปรับปรุง ---
+
+// ตรวจสอบว่า path แรกคือ 'appliances' (ไม่ใช่ 'api' แล้ว)
+// ตรวจสอบว่า $path ไม่ว่าง และ path[0] ต้องเป็น 'appliances' เท่านั้น
+if (empty($path) || $path[0] !== 'appliances') { 
+    Response::notFound('Endpoint not found'); 
+}
+
+// id จะเป็นค่าที่ 2 ใน path (path[0] คือ appliances, path[1] คือ id)
+$id = isset($path[1]) ? (int)$path[1] : null; 
+
+$controller = new ApplianceController();
+$data = [];
+
+// อ่าน JSON Body สำหรับ POST, PUT, PATCH
+if (in_array($method, ['POST', 'PUT', 'PATCH'])) {
+    $json_data = file_get_contents("php://input");
+    $data = json_decode($json_data, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        Response::badRequest(['body' => 'Invalid JSON format']);
+    }
+}
+
+// Routing Logic
+switch ($method) {
+    case 'GET':
+        $controller->read($id);
+        break;
+    case 'POST':
+        if ($id) Response::notFound(); // POST /api/appliances/{id} ไม่ถูกต้อง
+        $controller->create($data);
+        break;
+    case 'PUT':
+    case 'PATCH':
+        if (!$id) Response::badRequest(['id' => 'Missing product ID for update']);
+        $controller->update($id, $data);
+        break;
+    case 'DELETE':
+        if (!$id) Response::badRequest(['id' => 'Missing product ID for delete']);
+        $controller->delete($id);
+        break;
+    default:
+        Response::notFound('Method not supported');
+}
+?>

@@ -1,0 +1,13 @@
+RewriteEngine On
+# **สำคัญ:** ปรับ RewriteBase ให้ตรงกับชื่อโฟลเดอร์ใน htdocs/ ของคุณ
+# ถ้าติดตั้งที่ htdocs/appliances_api/public/ ให้ใช้ตามนี้:
+RewriteBase /appliances_api/public/
+
+# จัดการ CORS Pre-flight requests (OPTIONS method)
+RewriteCond %{REQUEST_METHOD} OPTIONS
+RewriteRule ^(.*)$ index.php [QSA,L]
+
+# ส่งทุก URL ที่ไม่ตรงกับไฟล์/โฟลเดอร์จริง ไปที่ index.php
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)$ index.php [QSA,L]

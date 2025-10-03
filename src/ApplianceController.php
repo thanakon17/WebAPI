@@ -1,292 +1,255 @@
 <?php
 // src/ApplianceController.php
 
-require_once 'Database.php';
-require_once 'Response.php';
+// ใช้ Response class
+require_once __DIR__ . '/Response.php';
+// ใช้ Database class
+require_once __DIR__ . '/Database.php';
 
 class ApplianceController {
-    private PDO $db;
+    private $db;
+    private $table_name = "appliances";
 
     public function __construct() {
-        try {
-            // สร้างการเชื่อมต่อ DB
-            $db_conn = (new Database())->getConnection();
-            if ($db_conn instanceof PDO) {
-                $this->db = $db_conn;
-            } else {
-                 // กรณี getConnection คืนค่า null (ไม่ควรเกิดขึ้นหากมีการโยน Exception ใน Database.php)
-                Response::json(500, ["error" => "Internal Server Error: Database connection failed."]);
-            }
-        } catch (Exception $e) {
-            // จัดการ Exception ที่มาจาก Database.php (Error 500)
-            Response::json(500, ["error" => "Internal Server Error", "details" => $e->getMessage()]);
-        }
+        $database = new Database();
+        $this->db = $database->connect();
     }
 
-    // --- Helper Functions สำหรับ Validation ---
+    /**
+     * ตรวจสอบว่ามี SKU ซ้ำหรือไม่
+     */
+    private function findBySku($sku, $id_to_exclude = null) {
+        $sql = "SELECT id FROM " . $this->table_name . " WHERE sku = :sku";
+        if ($id_to_exclude) {
+            $sql .= " AND id != :id_to_exclude";
+        }
+        $stmt = $this->db->prepare($sql);
+        $stmt->bindParam(':sku', $sku);
+        if ($id_to_exclude) {
+            $stmt->bindParam(':id_to_exclude', $id_to_exclude);
+        }
+        $stmt->execute();
+        return $stmt->fetch();
+    }
 
     /**
-     * ตรวจสอบความถูกต้องของข้อมูล (เฉพาะฟิลด์ที่ต้องการ)
-     * @param array $data ข้อมูลที่รับมาจาก Request Body
-     * @param bool $is_update หากเป็น true จะตรวจสอบเฉพาะฟิลด์ที่มีใน $data
-     * @return array หากมี error จะคืนค่าเป็น array ของ errors
+     * ตรวจสอบความถูกต้องของข้อมูล (Validation) สำหรับ POST/PUT/PATCH
      */
-    private function validateData(array $data, bool $is_update = false): array {
+    private function validateData(array $data, bool $is_create = true): array {
         $errors = [];
-        $required_fields = ['sku', 'name', 'brand', 'category', 'price', 'stock'];
-        
-        foreach ($required_fields as $field) {
-            // ตรวจสอบฟิลด์ที่จำเป็นต้องมีในโหมด Create
-            if (!$is_update && (!isset($data[$field]) || $data[$field] === '')) {
-                $errors[$field] = "is required";
+        $required_fields = ['sku', 'name', 'brand', 'category', 'price'];
+
+        // 1. ตรวจสอบฟิลด์ที่จำเป็นสำหรับการสร้าง
+        if ($is_create) {
+            foreach ($required_fields as $field) {
+                if (!isset($data[$field]) || $data[$field] === '') {
+                    $errors[$field] = ucfirst($field) . ' is required.';
+                }
             }
         }
-
-        // ตรวจสอบรูปแบบข้อมูล
-        if (isset($data['price']) && (!is_numeric($data['price']) || $data['price'] < 0)) {
-            $errors['price'] = "must be a non-negative number";
+        
+        // 2. ตรวจสอบประเภทข้อมูลและความถูกต้อง
+        if (isset($data['price'])) {
+            if (!is_numeric($data['price']) || $data['price'] < 0) {
+                $errors['price'] = 'Price must be a non-negative number.';
+            }
         }
-        if (isset($data['stock']) && (!is_numeric($data['stock']) || $data['stock'] < 0 || floor($data['stock']) != $data['stock'])) {
-            $errors['stock'] = "must be a non-negative integer";
+        if (isset($data['stock'])) {
+            if (!is_numeric($data['stock']) || $data['stock'] < 0 || floor($data['stock']) != $data['stock']) {
+                $errors['stock'] = 'Stock must be a non-negative integer.';
+            }
         }
-        if (isset($data['warranty_months']) && (!is_numeric($data['warranty_months']) || $data['warranty_months'] < 0 || floor($data['warranty_months']) != $data['warranty_months'])) {
-            $errors['warranty_months'] = "must be a non-negative integer";
-        }
-        if (isset($data['energy_rating']) && (!is_numeric($data['energy_rating']) || $data['energy_rating'] < 1 || $data['energy_rating'] > 5)) {
-            $errors['energy_rating'] = "must be an integer between 1 and 5";
+        if (isset($data['sku']) && strlen($data['sku']) > 32) {
+             $errors['sku'] = 'SKU cannot exceed 32 characters.';
         }
 
         return $errors;
     }
 
-    /**
-     * ตรวจสอบว่า SKU ซ้ำกันหรือไม่
-     * @param string $sku SKU ที่จะตรวจสอบ
-     * @param int|null $exclude_id ID ของสินค้าที่ต้องการยกเว้น (ใช้ในการ Update)
-     * @return bool
-     */
-    private function isSkuDuplicate(string $sku, ?int $exclude_id = null): bool {
-        $sql = "SELECT COUNT(*) FROM appliances WHERE sku = :sku " . ($exclude_id ? "AND id != :id" : "");
-        $stmt = $this->db->prepare($sql);
-        $stmt->bindParam(':sku', $sku);
-        if ($exclude_id) {
-            $stmt->bindParam(':id', $exclude_id, PDO::PARAM_INT);
-        }
-        $stmt->execute();
-        return (bool) $stmt->fetchColumn();
-    }
-
-    // --- CRUD Methods ---
-
-    /**
-     * [GET] ดึงรายการสินค้าทั้งหมด หรือค้นหา
-     */
-    public function index(): void {
-        $sql = "SELECT * FROM appliances";
-        $params = [];
-        $where = [];
-        
-        // ตัวอย่างการกรอง/ค้นหา (ตามโจทย์: ?category=ทีวี&sort=price_asc)
-        if (isset($_GET['category']) && $_GET['category']) {
-            $where[] = "category = :category";
-            $params[':category'] = $_GET['category'];
-        }
-
-        if (!empty($where)) {
-            $sql .= " WHERE " . implode(" AND ", $where);
-        }
-
-        // ตัวอย่างการจัดเรียง
-        $sort_by = "created_at DESC";
-        if (isset($_GET['sort'])) {
-            $sort = strtolower($_GET['sort']);
-            if ($sort === 'price_asc') {
-                $sort_by = "price ASC";
-            } elseif ($sort === 'price_desc') {
-                $sort_by = "price DESC";
-            } elseif ($sort === 'name_asc') {
-                $sort_by = "name ASC";
-            }
-        }
-        $sql .= " ORDER BY " . $sort_by;
-        
-        try {
-            $stmt = $this->db->prepare($sql);
-            $stmt->execute($params);
-            $appliances = $stmt->fetchAll();
-            
-            Response::json(200, ["data" => $appliances]);
-        } catch (PDOException $e) {
-            Response::json(500, ["error" => "Database Query Error", "details" => $e->getMessage()]);
-        }
-    }
-
-    /**
-     * [GET] ดึงสินค้า 1 รายการ
-     * @param int $id ID สินค้า
-     */
-    public function show(int $id): void {
-        $sql = "SELECT * FROM appliances WHERE id = :id";
-        
-        try {
-            $stmt = $this->db->prepare($sql);
+    // --- 1. READ (GET) ---
+    public function read($id) {
+        if ($id) {
+            // GET /api/appliances/{id}
+            $stmt = $this->db->prepare("SELECT * FROM " . $this->table_name . " WHERE id = :id");
             $stmt->bindParam(':id', $id, PDO::PARAM_INT);
             $stmt->execute();
-            $appliance = $stmt->fetch();
+            $product = $stmt->fetch();
 
-            if (!$appliance) {
-                Response::json(404, ["error" => "Not found"]);
+            if ($product) {
+                Response::success($product);
+            } else {
+                Response::notFound();
+            }
+        } else {
+            // GET /api/appliances (ทั้งหมด/ค้นหา/กรอง)
+            // ดึง Query Parameters
+            $category = $_GET['category'] ?? null;
+            $min_price = $_GET['min_price'] ?? null;
+            $max_price = $_GET['max_price'] ?? null;
+            $sort = $_GET['sort'] ?? 'id_asc';
+            $page = (int)($_GET['page'] ?? 1);
+            $per_page = (int)($_GET['per_page'] ?? 10);
+            
+            $where = [];
+            $params = [];
+            
+            if ($category) {
+                $where[] = "category = :category";
+                $params[':category'] = $category;
+            }
+            if ($min_price && is_numeric($min_price)) {
+                $where[] = "price >= :min_price";
+                $params[':min_price'] = $min_price;
+            }
+            if ($max_price && is_numeric($max_price)) {
+                $where[] = "price <= :max_price";
+                $params[':max_price'] = $max_price;
+            }
+
+            $sql = "SELECT * FROM " . $this->table_name;
+            if (!empty($where)) {
+                $sql .= " WHERE " . implode(' AND ', $where);
+            }
+
+            // การเรียงลำดับ (Sort)
+            $order_map = [
+                'price_asc' => 'price ASC',
+                'price_desc' => 'price DESC',
+                'name_asc' => 'name ASC',
+                'id_asc' => 'id ASC'
+            ];
+            $order_by = $order_map[$sort] ?? 'id ASC';
+            $sql .= " ORDER BY " . $order_by;
+
+            // Pagination
+            $offset = ($page - 1) * $per_page;
+            $sql .= " LIMIT :limit OFFSET :offset";
+            $params[':limit'] = $per_page;
+            $params[':offset'] = $offset;
+
+            $stmt = $this->db->prepare($sql);
+            foreach ($params as $key => &$val) {
+                // ต้องใช้ bindValue เพราะการ binding ต้องรู้ type
+                $type = is_int($val) ? PDO::PARAM_INT : (is_numeric($val) ? PDO::PARAM_STR : PDO::PARAM_STR);
+                $stmt->bindValue($key, $val, $type);
             }
             
-            Response::json(200, ["data" => $appliance]);
-        } catch (PDOException $e) {
-             Response::json(500, ["error" => "Database Query Error", "details" => $e->getMessage()]);
-        }
-    }
-
-    /**
-     * [POST] สร้างสินค้าใหม่
-     * @param array $data ข้อมูลที่รับมาจาก JSON Body
-     */
-    public function store(array $data): void {
-        $errors = $this->validateData($data);
-        if (!empty($errors)) {
-            Response::json(400, ["error" => "Validation failed", "details" => $errors]);
-        }
-
-        if ($this->isSkuDuplicate($data['sku'])) {
-            Response::json(409, ["error" => "SKU already exists"]);
-        }
-
-        $sql = "INSERT INTO appliances (sku, name, brand, category, price, stock, warranty_months, energy_rating) 
-                VALUES (:sku, :name, :brand, :category, :price, :stock, :warranty_months, :energy_rating)";
-        
-        try {
-            $stmt = $this->db->prepare($sql);
-
-            // Bind values
-            $stmt->bindParam(':sku', $data['sku']);
-            $stmt->bindParam(':name', $data['name']);
-            $stmt->bindParam(':brand', $data['brand']);
-            $stmt->bindParam(':category', $data['category']);
-            $stmt->bindParam(':price', $data['price']);
-            $stmt->bindParam(':stock', $data['stock'], PDO::PARAM_INT);
-            // ใช้ NULL สำหรับค่าที่อาจว่าง (เช่น energy_rating, warranty_months หากไม่ระบุ)
-            $warranty = $data['warranty_months'] ?? 12; // ใช้ค่า default 12 หากไม่ส่งมา
-            $energy = $data['energy_rating'] ?? null;
-            $stmt->bindParam(':warranty_months', $warranty, PDO::PARAM_INT);
-            $stmt->bindParam(':energy_rating', $energy, PDO::PARAM_INT);
-
             $stmt->execute();
-            $last_id = $this->db->lastInsertId();
-
-            // ดึงข้อมูลสินค้าที่สร้างใหม่มาแสดง
-            $this->show((int) $last_id); // show() จะส่ง 200 OK แต่เราต้องใช้ 201 Created
-
-        } catch (PDOException $e) {
-            // กรณีเกิดข้อผิดพลาดอื่น ๆ (เช่น column ถูกตัด, DB error)
-            Response::json(500, ["error" => "Failed to create appliance", "details" => $e->getMessage()]);
-        }
-    }
-
-    /**
-     * [PUT/PATCH] แก้ไขสินค้า
-     * @param int $id ID สินค้าที่ต้องการแก้ไข
-     * @param array $data ข้อมูลที่รับมาจาก JSON Body
-     */
-    public function update(int $id, array $data): void {
-        // 1. ตรวจสอบว่ามีสินค้าหรือไม่
-        $sql_check = "SELECT sku FROM appliances WHERE id = :id";
-        $stmt_check = $this->db->prepare($sql_check);
-        $stmt_check->bindParam(':id', $id, PDO::PARAM_INT);
-        $stmt_check->execute();
-        $current_appliance = $stmt_check->fetch();
-        
-        if (!$current_appliance) {
-            Response::json(404, ["error" => "Not found"]);
-        }
-
-        // 2. ตรวจสอบความถูกต้องของข้อมูลที่ส่งมา (validate only submitted fields)
-        $errors = $this->validateData($data, true);
-        if (!empty($errors)) {
-            Response::json(400, ["error" => "Validation failed", "details" => $errors]);
-        }
-
-        // 3. ตรวจสอบ SKU ซ้ำ (เฉพาะเมื่อมีการส่งค่า sku มาและ sku นั้นไม่ซ้ำกับของตัวเอง)
-        if (isset($data['sku']) && $data['sku'] !== $current_appliance['sku']) {
-            if ($this->isSkuDuplicate($data['sku'], $id)) {
-                Response::json(409, ["error" => "SKU already exists"]);
-            }
-        }
-        
-        // 4. สร้าง SET clause และ parameters สำหรับ UPDATE
-        $set_parts = [];
-        $update_params = [':id' => $id];
-        $allowed_fields = ['sku', 'name', 'brand', 'category', 'price', 'stock', 'warranty_months', 'energy_rating'];
-
-        foreach ($allowed_fields as $field) {
-            if (isset($data[$field])) {
-                $set_parts[] = "{$field} = :{$field}";
-                $update_params[":{$field}"] = $data[$field];
-                
-                // สำหรับฟิลด์ที่อาจเป็น NULL (เช่น energy_rating)
-                if ($field === 'energy_rating' && empty($data[$field])) {
-                    $update_params[":{$field}"] = null;
-                }
-            }
-        }
-        
-        if (empty($set_parts)) {
-            // ถ้าไม่มีฟิลด์ใดถูกส่งมาเลย
-            Response::json(400, ["error" => "No fields provided for update"]);
-        }
-
-        $sql = "UPDATE appliances SET " . implode(", ", $set_parts) . " WHERE id = :id";
-
-        try {
-            $stmt = $this->db->prepare($sql);
-            $stmt->execute($update_params);
-
-            // ดึงข้อมูลล่าสุดมาแสดง
-            $sql_fetch = "SELECT * FROM appliances WHERE id = :id";
-            $stmt_fetch = $this->db->prepare($sql_fetch);
-            $stmt_fetch->bindParam(':id', $id, PDO::PARAM_INT);
-            $stmt_fetch->execute();
-            $updated_appliance = $stmt_fetch->fetch();
-
-            Response::json(200, ["message" => "Updated", "data" => $updated_appliance]);
+            $products = $stmt->fetchAll();
             
-        } catch (PDOException $e) {
-            Response::json(500, ["error" => "Failed to update appliance", "details" => $e->getMessage()]);
+            // ควรเพิ่ม total count ด้วย แต่เพื่อความรวดเร็วจะส่งแค่ data
+            Response::success(["data" => $products]);
         }
     }
 
-    /**
-     * [DELETE] ลบสินค้า
-     * @param int $id ID สินค้าที่ต้องการลบ
-     */
-    public function delete(int $id): void {
-        // 1. ตรวจสอบว่ามีสินค้าหรือไม่
-        $sql_check = "SELECT id FROM appliances WHERE id = :id";
-        $stmt_check = $this->db->prepare($sql_check);
-        $stmt_check->bindParam(':id', $id, PDO::PARAM_INT);
-        $stmt_check->execute();
-        
-        if (!$stmt_check->fetch()) {
-            Response::json(404, ["error" => "Not found"]);
+    // --- 2. CREATE (POST) ---
+    public function create($data) {
+        // 1. Validation
+        $validation_errors = $this->validateData($data, true);
+        if (!empty($validation_errors)) {
+            Response::badRequest($validation_errors); // 400 Bad Request
         }
 
-        // 2. ดำเนินการลบ
-        $sql_delete = "DELETE FROM appliances WHERE id = :id";
-        
-        try {
-            $stmt_delete = $this->db->prepare($sql_delete);
-            $stmt_delete->bindParam(':id', $id, PDO::PARAM_INT);
-            $stmt_delete->execute();
+        // 2. ตรวจสอบ SKU ซ้ำ (409 Conflict)
+        if ($this->findBySku($data['sku'])) {
+            Response::conflict();
+        }
 
-            Response::json(200, ["message" => "Deleted"]);
-        } catch (PDOException $e) {
-            Response::json(500, ["error" => "Failed to delete appliance", "details" => $e->getMessage()]);
+        // 3. INSERT (Prepared Statement)
+        $fields = array_keys($data);
+        $placeholders = array_map(fn($f) => ":$f", $fields);
+        
+        $sql = "INSERT INTO " . $this->table_name . " (" . implode(', ', $fields) . ") VALUES (" . implode(', ', $placeholders) . ")";
+        $stmt = $this->db->prepare($sql);
+        
+        foreach ($data as $key => &$value) {
+            $stmt->bindParam(":$key", $value);
+        }
+
+        if ($stmt->execute()) {
+            $new_id = $this->db->lastInsertId();
+            // ดึงข้อมูลสินค้าใหม่กลับมา
+            $stmt_select = $this->db->prepare("SELECT * FROM " . $this->table_name . " WHERE id = ?");
+            $stmt_select->execute([$new_id]);
+            Response::created($stmt_select->fetch());
+        } else {
+            // กรณีเกิดข้อผิดพลาดอื่น ๆ ในฐานข้อมูล (เช่น 500 Internal Server Error)
+            http_response_code(500);
+            echo json_encode(["error" => "Could not create appliance"]);
+            exit();
+        }
+    }
+    
+    // --- 3. UPDATE (PUT/PATCH) ---
+    public function update($id, $data) {
+        // 1. Validation
+        if (empty($data)) {
+            Response::badRequest(['body' => 'Request body cannot be empty']);
+        }
+        $validation_errors = $this->validateData($data, false); // ไม่บังคับ required field
+        if (!empty($validation_errors)) {
+            Response::badRequest($validation_errors); // 400 Bad Request
+        }
+
+        // 2. ตรวจสอบว่าสินค้ามีอยู่จริงหรือไม่ (404 Not Found)
+        $stmt_check = $this->db->prepare("SELECT id FROM " . $this->table_name . " WHERE id = :id");
+        $stmt_check->bindParam(':id', $id, PDO::PARAM_INT);
+        $stmt_check->execute();
+        if (!$stmt_check->fetch()) {
+            Response::notFound();
+        }
+
+        // 3. ตรวจสอบ SKU ซ้ำ หากมีการแก้ไข SKU (409 Conflict)
+        if (isset($data['sku']) && $this->findBySku($data['sku'], $id)) {
+            Response::conflict();
+        }
+        
+        // 4. UPDATE (Prepared Statement)
+        $set_parts = [];
+        foreach ($data as $key => $value) {
+            $set_parts[] = "$key = :$key";
+        }
+        
+        $sql = "UPDATE " . $this->table_name . " SET " . implode(', ', $set_parts) . " WHERE id = :id";
+        $stmt = $this->db->prepare($sql);
+
+        $stmt->bindParam(':id', $id, PDO::PARAM_INT);
+        foreach ($data as $key => &$value) {
+            $stmt->bindParam(":$key", $value);
+        }
+
+        if ($stmt->execute()) {
+            // ดึงข้อมูลสินค้าล่าสุดกลับมา
+            $stmt_select = $this->db->prepare("SELECT * FROM " . $this->table_name . " WHERE id = ?");
+            $stmt_select->execute([$id]);
+            Response::success($stmt_select->fetch(), 'Updated');
+        } else {
+            http_response_code(500);
+            echo json_encode(["error" => "Could not update appliance"]);
+            exit();
+        }
+    }
+
+    // --- 4. DELETE (DELETE) ---
+    public function delete($id) {
+        // 1. ตรวจสอบว่าสินค้ามีอยู่จริงหรือไม่ (404 Not Found)
+        $stmt_check = $this->db->prepare("SELECT id FROM " . $this->table_name . " WHERE id = :id");
+        $stmt_check->bindParam(':id', $id, PDO::PARAM_INT);
+        $stmt_check->execute();
+        if (!$stmt_check->fetch()) {
+            Response::notFound();
+        }
+        
+        // 2. DELETE (Prepared Statement)
+        $stmt = $this->db->prepare("DELETE FROM " . $this->table_name . " WHERE id = :id");
+        $stmt->bindParam(':id', $id, PDO::PARAM_INT);
+
+        if ($stmt->execute()) {
+            Response::success(null, 'Deleted');
+        } else {
+            http_response_code(500);
+            echo json_encode(["error" => "Could not delete appliance"]);
+            exit();
         }
     }
 }
