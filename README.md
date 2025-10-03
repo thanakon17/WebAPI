@@ -1,6 +1,7 @@
 Lab10 - Web API
 สร้างฐานข้อมูล MySQL
 <img width="856" height="98" alt="image" src="https://github.com/user-attachments/assets/b16adb10-5a3c-4844-9c81-2d321ea85a48" />
+
 ตารางข้อมูลสินค้า (products)
 <img width="1915" height="454" alt="Screenshot 2025-10-03 160414" src="https://github.com/user-attachments/assets/5d6a7fcd-2b38-4070-bb8c-bd7a3fbc2243" />
 
